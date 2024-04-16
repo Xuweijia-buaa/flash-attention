@@ -92,7 +92,7 @@ ext_modules = []
 
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
-subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
+subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])  # 更新cutlass的源码
 
 if not SKIP_CUDA_BUILD:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
@@ -132,9 +132,9 @@ if not SKIP_CUDA_BUILD:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
     ext_modules.append(
         CUDAExtension(
-            name="flash_attn_2_cuda",
-            sources=[
-                "csrc/flash_attn/flash_api.cpp",
+            name="flash_attn_2_cuda",   # cuda包，由csrc/flash_attn中的代码编译。入口函数是csrc/flash_attn/flash_api.cpp
+            sources=[   # 源码，只含csrc/flash_attn的文件
+                "csrc/flash_attn/flash_api.cpp", # 入口
                 "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim64_fp16_sm80.cu",
@@ -185,10 +185,12 @@ if not SKIP_CUDA_BUILD:
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_sm80.cu",
             ],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"] + generator_flag,
+                # "cxx": ["-O3", "-std=c++17"] + generator_flag,  # debug，带 -G -g ?
+                "cxx": ["-g", "-std=c++17"] + generator_flag,  # debug，带 -G -g ?
                 "nvcc": append_nvcc_threads(
                     [
-                        "-O3",
+                        # "-O3",
+                        "-G",
                         "-std=c++17",
                         "-U__CUDA_NO_HALF_OPERATORS__",
                         "-U__CUDA_NO_HALF_CONVERSIONS__",
@@ -202,12 +204,14 @@ if not SKIP_CUDA_BUILD:
                         # "-lineinfo",
                     ]
                     + generator_flag
-                    + cc_flag
+                    + cc_flag   # 架构
                 ),
             },
             include_dirs=[
                 Path(this_dir) / "csrc" / "flash_attn",
                 Path(this_dir) / "csrc" / "flash_attn" / "src",
+                # 只要编译时，include文件里，加上cutlass的include即可
+                # cutlass源码，和csrc/flash_attn(要编译的cpp源文件)放相同目录，都是csrc目录下
                 Path(this_dir) / "csrc" / "cutlass" / "include",
             ],
         )
@@ -249,6 +253,7 @@ def get_wheel_url():
 
 
 class CachedWheelsCommand(_bdist_wheel):
+    # 已有就不重新build了
     """
     The CachedWheelsCommand plugs into the default bdist wheel, which is ran by pip when it cannot
     find an existing wheel (which is currently the case for all flash attention installs). We use
@@ -302,9 +307,31 @@ class NinjaBuildExtension(BuildExtension):
 
         super().__init__(*args, **kwargs)
 
+# python setup.py install
+# python setup.py bdist_wheel
+# 建一个python包：名为flash_attn
+# 使用入口是：flash_attn/modules/mha.py 。 里边的模型和类MHA，使用了flash_attn包中的组件 
+#                                         这些组件都定义在flash_attn/flash_attn_interface.py中
+#           models/gpt.py(bert.py)里，使用了MHA类。
+#           test里也直接使用了MHA，可以作为调用的入口：
+#                 tests/modules/test_block_parallel.py
+#                 tests/modules/test_mha_parallel.py
 
+# 其中这里编译的cuda包，包名是"flash_attn_2_cuda",   
+# 源码来自于csrc/flash_attn中的所有代码。其中pybind11入口函数是csrc/flash_attn/flash_api.cpp,注册cpp中代码给pythin调用
+# 注册了函数
+    # m.def("fwd", &mha_fwd, "Forward pass");
+    # m.def("varlen_fwd", &mha_varlen_fwd, "Forward pass (variable length)");
+    # m.def("bwd", &mha_bwd, "Backward pass");
+    # m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
+    # m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
+# 该cuda包主要用在python包的flash_attn_interface.py中
+
+# 线程数开太多会耗尽ram
+# MAX_JOBS=3 pip install -e .  --no-build-isolation (在vllm环境下，对应cuda12.1的pytorch)
+# 
 setup(
-    name=PACKAGE_NAME,
+    name=PACKAGE_NAME,  # flash_attn   python包
     version=get_package_version(),
     packages=find_packages(
         exclude=(

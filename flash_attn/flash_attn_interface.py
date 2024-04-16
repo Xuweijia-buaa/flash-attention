@@ -7,7 +7,9 @@ import torch.nn as nn
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
-import flash_attn_2_cuda as flash_attn_cuda
+# 用csrc中的代码编译成的cuda包。
+# 对应cuda包的入口文件： csrc/flash_attn/flash_api.cpp。 注册了pybind11中的5个函数，在这里用
+import flash_attn_2_cuda as flash_attn_cuda 
 
 # isort: on
 

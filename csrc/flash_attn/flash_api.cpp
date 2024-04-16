@@ -20,26 +20,26 @@
 
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
-                      const size_t b,
-                      const size_t seqlen_q,
-                      const size_t seqlen_k,
-                      const size_t seqlen_q_rounded,
+                      const size_t b,//batch
+                      const size_t seqlen_q,    // Tq   整个要算的q token数目
+                      const size_t seqlen_k,    // Tv   整个要算的v token数目
+                      const size_t seqlen_q_rounded,  // Tq变128的倍数
                       const size_t seqlen_k_rounded,
-                      const size_t h,
+                      const size_t h,           // num_head_q' num_head_v
                       const size_t h_k,
-                      const size_t d,
-                      const size_t d_rounded,
+                      const size_t d,           // head_dim
+                      const size_t d_rounded,   // head_dim   32的倍数
                       // device pointers
-                      const at::Tensor q,
-                      const at::Tensor k,
-                      const at::Tensor v,
-                      at::Tensor out,
-                      void *cu_seqlens_q_d,
+                      const at::Tensor q,       // q,k,v,out的指针   （B,Tq,nhead,head_dim）
+                      const at::Tensor k,       //  (B,Tv,num_head,head_dim)
+                      const at::Tensor v,       //  (B,Tv,num_head,head_dim)
+                      at::Tensor out,           //  (B,Tq,num_head,head_dim)
+                      void *cu_seqlens_q_d,   // null
                       void *cu_seqlens_k_d,
                       void *seqused_k,
-                      void *p_d,
-                      void *softmax_lse_d,
-                      float p_dropout,
+                      void *p_d,              // null
+                      void *softmax_lse_d,    //  (B,nhead,Tq),empty
+                      float p_dropout,        // （B,nhead,Tq,Tk） empty. 返回的softmax
                       float softmax_scale,
                       int window_size_left,
                       int window_size_right,
@@ -55,10 +55,10 @@ void set_params_fprop(Flash_fwd_params &params,
     params.k_ptr = k.data_ptr();
     params.v_ptr = v.data_ptr();
     // All stride are in elements, not bytes.
-    params.q_row_stride = q.stride(-3);
+    params.q_row_stride = q.stride(-3);  // 1吧。最后一维
     params.k_row_stride = k.stride(-3);
     params.v_row_stride = v.stride(-3);
-    params.q_head_stride = q.stride(-2);
+    params.q_head_stride = q.stride(-2); // 不同head间stride.   head_dim * stride_head_dim
     params.k_head_stride = k.stride(-2);
     params.v_head_stride = v.stride(-2);
     params.o_ptr = out.data_ptr();
@@ -66,7 +66,7 @@ void set_params_fprop(Flash_fwd_params &params,
     params.o_head_stride = out.stride(-2);
 
     if (cu_seqlens_q_d == nullptr) {
-        params.q_batch_stride = q.stride(0);
+        params.q_batch_stride = q.stride(0);   // 不同batch间的stride 相邻2样本间，内存元素间隔 （Tq,nhead,head_dim）
         params.k_batch_stride = k.stride(0);
         params.v_batch_stride = v.stride(0);
         params.o_batch_stride = out.stride(0);
@@ -84,18 +84,18 @@ void set_params_fprop(Flash_fwd_params &params,
     params.p_ptr = p_d;
 
     // Softmax sum
-    params.softmax_lse_ptr = softmax_lse_d;
+    params.softmax_lse_ptr = softmax_lse_d;  // 存每个q token的softmax sum  (B,nhead,Tq)
 
     // Set the dimensions.
-    params.b = b;
-    params.h = h;
+    params.b = b;           // batch
+    params.h = h;           // num_head_q' num_head_v
     params.h_k = h_k;
     params.h_h_k_ratio = h / h_k;
-    params.seqlen_q = seqlen_q;
-    params.seqlen_k = seqlen_k;
-    params.seqlen_q_rounded = seqlen_q_rounded;
+    params.seqlen_q = seqlen_q;   // Tq
+    params.seqlen_k = seqlen_k;   // Tv
+    params.seqlen_q_rounded = seqlen_q_rounded;// Tq,Tv,变128的倍数
     params.seqlen_k_rounded = seqlen_k_rounded;
-    params.d = d;
+    params.d = d;                 // head_dim,head_dim 32的倍数
     params.d_rounded = d_rounded;
 
     // Set the different scale values.
@@ -218,8 +218,14 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
+                // 根据数据类型。和headdim,选用对应kernel
+                // 对应不同文件：flash_fwd_hdim*_dtype*_sm80.cu
+                // 对应 run_mha_fwd_hdim*<cutlass::dtype*>(params, stream);
+                // 不同shape,dtype,函数实现都在flash_fwd_launch_template.h中
+                // 最终调用run_flash_fwd
                 run_mha_fwd_<elem_type, kHeadDim>(params, stream);
             } else {
+                // 最终调用run_flash_splitkv_fwd
                 run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim>(params, stream);
             }
         });
@@ -232,7 +238,11 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
 // splits as that would incur more HBM reads/writes.
 // So we find the best efficiency, then find the smallest number of splits that gets 85%
 // of the best efficiency.
-inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
+inline int num_splits_heuristic(
+    int batch_nheads_mblocks,   // batch*nhead*   m方向的blocks(Tq切分)   每个块Qi，交给一个cudablock处理，迭代Tv。
+    int num_SMs,                // 设备上总的SM数目
+     int num_n_blocks,          // Tv方向的block数目
+     int max_splits) {          // 128
     // If we have enough to almost fill the SMs, then just use 1 split
     if (batch_nheads_mblocks >= 0.8f * num_SMs) { return 1; }
     max_splits = std::min({max_splits, num_SMs, num_n_blocks});
@@ -269,20 +279,31 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
 }
 
 void set_params_splitkv(Flash_fwd_params &params, const int batch_size,
-    const int num_heads, const int head_size, const int max_seqlen_k, const int max_seqlen_q,
+    const int num_heads, const int head_size, 
+    const int max_seqlen_k, // 总的Tv
+    const int max_seqlen_q, // 总的Tq
     const int head_size_rounded, const float p_dropout,
     const int num_splits, cudaDeviceProp *dprops, struct c10::TensorOptions opts) {
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
-    const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
-    const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
+    // 对KV进行划分：整个Tv, 每64个token划分为一个块，共划分为【num_n_blocks】个块
+    const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);  // 每64个token划分为一个块
+    const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;            // Tv划分为几个块
+    
+    // 对Tq进行划分，每64个token划分为一个块，共沿行划分为【num_m_blocks】个块
     // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
     // In any case we don't expect seqlen_q to be larger than 64 for inference.
     const int num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
+
+    // qkv每个块，拿到share_mem，对应一次计算。
+    // cudablocks内部，固定qi(m,d), 迭代kivi所有块,计算oi(m,d)
+    // 每个块Qi，交给一个cudablock处理，迭代Tv。(共batch*nhead*m)个Qi块。 每个Qi(Br,d=head_dim)
     params.num_splits = num_splits;
     if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
         if (num_splits < 1) {
-            params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, dprops->multiProcessorCount, num_n_blocks, 128);
+            params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, 
+                                 dprops->multiProcessorCount, 
+                                 num_n_blocks, 128);
         }
         if (params.num_splits > 1) {
             at::Tensor softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
@@ -314,9 +335,9 @@ void set_params_alibi(Flash_fwd_params &params, c10::optional<at::Tensor> &alibi
 }
 
 std::vector<at::Tensor>
-mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
-        const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x head_size
-        const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x head_size
+mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size  (B,Tq,num_head,head_dim)
+        const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x head_size  (B,Tv,num_head,head_dim)
+        const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x head_size  (B,Tv,num_head,head_dim)
         c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
         c10::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
         const float p_dropout,
@@ -352,12 +373,12 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
 
     const auto sizes = q.sizes();
 
-    const int batch_size = sizes[0];
-    int seqlen_q = sizes[1];
-    int num_heads = sizes[2];
-    const int head_size_og = sizes[3];
-    const int seqlen_k = k.size(1);
-    const int num_heads_k = k.size(2);
+    const int batch_size = sizes[0];  // B
+    int seqlen_q = sizes[1];          // Tq
+    int num_heads = sizes[2];         // num_head_q
+    const int head_size_og = sizes[3];// head_dim
+    const int seqlen_k = k.size(1);   // Tv
+    const int num_heads_k = k.size(2);// num_head_v
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
     TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
@@ -403,11 +424,11 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_og);
         if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
     } else {
-        out = torch::empty_like(q_padded);
+        out = torch::empty_like(q_padded); // 同q (B,Tq,num_q,head_dim)
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
-    const int head_size = round_multiple(head_size_og, 8);
+    const int head_size = round_multiple(head_size_og, 8);       // 变成8的整数倍  (15+8-1)/8*8=16
     const int head_size_rounded = round_multiple(head_size, 32);
     const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
@@ -418,11 +439,14 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
 
     auto opts = q.options();
 
-    auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    //(B,n_head,Tq)(用来存softmax的中间值？)
+    auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));//(B,n_head,Tq)(用来存softmax？)
+
     at::Tensor p;
     // Only return softmax if there's dropout to reduce compilation time
     if (return_softmax) {
         TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
+        // 返回的最终softmax值 （Tq,Tk）
         p = torch::empty({ batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded }, opts);
     }
 
@@ -433,21 +457,24 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      seqlen_q_rounded, seqlen_k_rounded,
                      num_heads, num_heads_k,
                      head_size, head_size_rounded,
-                     q_padded, k_padded, v_padded, out,
+                     q_padded, k_padded, v_padded, out, // 真实Tensor
                      /*cu_seqlens_q_d=*/nullptr,
                      /*cu_seqlens_k_d=*/nullptr,
                      /*seqused_k=*/nullptr,
                      return_softmax ? p.data_ptr() : nullptr,
-                     softmax_lse.data_ptr(),
-                     p_dropout,
-                     softmax_scale,
+                     softmax_lse.data_ptr(),  // (B,nhead,Tq),empty
+                     p_dropout,              // （B,nhead,Tq,Tk）
+                     softmax_scale,    
                      window_size_left,
                      window_size_right);
 
 
-    set_params_splitkv(params, batch_size, num_heads,
-                       head_size, seqlen_k, seqlen_q,
-                       head_size_rounded, p_dropout, /*num_splits*/0, dprops, opts);
+    set_params_splitkv(params, batch_size, num_heads, // 只设置了num_splits参数，默认是1
+                       head_size, 
+                       seqlen_k, // 总的Tv   切分成n个块
+                       seqlen_q, // 总的Tq   切分成m个块。看总的块数与SM的关系，如果还行，不进一步split (具体逻辑未看)
+                       head_size_rounded, 
+                       p_dropout, /*num_splits*/0, dprops, opts);
 
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
@@ -470,6 +497,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
 
     if (seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
+        // 核心算子部分
         run_mha_fwd(params, stream);
     } else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
@@ -686,8 +714,11 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     params.page_block_size = page_block_size;
     if (seqlenq_ngroups_swapped) {
         // Only apply split-k for decoding
-        set_params_splitkv(params, batch_size, num_heads,
-                           head_size, max_seqlen_k, max_seqlen_q,
+        set_params_splitkv(params, batch_size, 
+                           num_heads,       // n_head_q
+                           head_size, 
+                           max_seqlen_k,   // 总的Tv
+                           max_seqlen_q,  // 总的Tq
                            head_size_rounded, p_dropout, /*num_splits*/0, dprops, opts);
     }
 
@@ -1489,8 +1520,11 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     return {out, softmax_lse};
 }
 
+
+// cuda包的入口函数。给python调用。 CUDAEXTENSION编译
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
+    // 5个函数，提供给python包flash_attn中的flash_attn_interface.py，使用
     m.def("fwd", &mha_fwd, "Forward pass");
     m.def("varlen_fwd", &mha_varlen_fwd, "Forward pass (variable length)");
     m.def("bwd", &mha_bwd, "Backward pass");

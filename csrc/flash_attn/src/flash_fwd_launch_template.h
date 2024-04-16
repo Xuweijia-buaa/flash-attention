@@ -48,6 +48,9 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int L
     flash::combine_attn_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K>(params);
 }
 
+// 不同shape. 不同dtype的统一入口
+// Kernel_traits是： Flash_fwd_kernel_traits<Headdim, 128,    64,     4,         false,         false,          T>
+//                                                   blockM,blockN,kNWarps_==4, Is_Q_in_regs_, Share_Q_K_smem_
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
@@ -56,9 +59,14 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // Work-around for gcc 7. It doesn't like nested BOOL_SWITCH.
     // https://github.com/kokkos/kokkos-kernels/issues/349
     // https://github.com/HazyResearch/flash-attention/issues/21
-
+    
+    // 对整个Tq进行拆分，拆成kBlockM大小. 共num_m_block个
+    // M维，Tq的每个块， 交给一个cudablock处理
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
-    dim3 grid(num_m_block, params.b, params.h);
+    // batch中每个样本，每个head中，Tq的一个块Qi,交给一个cudablock处理
+    dim3 grid(num_m_block, params.b, params.h); 
+
+
     const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
     const bool return_softmax = params.p_ptr != nullptr;
@@ -72,18 +80,16 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                         // If return_softmax, set IsEvenMNConst to false to reduce number of templates
                         // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
                         // If Is_local, set Is_causal to false
+
+                        // 真正要执行的kernel:  TODO
                         auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && !ReturnSoftmaxConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, ReturnSoftmaxConst && Is_dropout>;
-                        // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, false, true, true, false>;
-                        // printf("IsEvenMNConst = %d, IsEvenKConst = %d, Is_local = %d, Is_causal = %d, ReturnSoftmaxConst = %d, Is_dropout = %d\n", int(IsEvenMNConst), int(IsEvenKConst), int(Is_local), int(Is_causal), int(ReturnSoftmaxConst), int(Is_dropout));
-                        // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, true, true, false>;
+                        
                         if (smem_size >= 48 * 1024) {
                             C10_CUDA_CHECK(cudaFuncSetAttribute(
                                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
                         }
-                        // int ctas_per_sm;
-                        // cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                        //     &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
-                        // printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
+
+                        // 执行kernel
                         kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
                     });
@@ -98,8 +104,12 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!Kernel_traits::Is_Q_in_regs, "SplitKV implementation does not support Is_Q_in_regs");
     static_assert(!Kernel_traits::Share_Q_K_smem, "SplitKV implementation does not support Share_Q_K_smem");
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
+    // 对整个Tq进行拆分，拆成kBlockM大小. 共num_m_block个
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+    // split==1:grid(num_m_blocks,b,h):batch中每个样本，每个head中，Tq的一个块Qi,交给一个cudablock处理 (num_blocks,b,h)
+    // split>1:grid(num_m_blocks,num_splits,bh): TODO 
     dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
+    
     const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -119,6 +129,8 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                     C10_CUDA_CHECK(cudaFuncSetAttribute(
                                         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
                                 }
+
+                                // 执行kernel
                                 kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
                                 C10_CUDA_KERNEL_LAUNCH_CHECK();
                             });
@@ -165,6 +177,7 @@ void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream)
     run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>>(params, stream);
 }
 
+// 下边的，除了size,其他都一样，都是调用run_flash_fwd
 template<typename T>
 void run_mha_fwd_hdim32(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 32;
@@ -233,6 +246,7 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
             if constexpr(!Is_dropout) {
                 // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
                 // and 128 x 32 (48 KB smem) is the fastest for non-causal since we get 2 CTAs per SM.
+                // 只是choose. 除了size,其他都一样
                 if (is_sm8x) {
                     if constexpr(!Is_causal) {
                         run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
