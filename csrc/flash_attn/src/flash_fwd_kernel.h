@@ -340,7 +340,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         __syncthreads();  // 同步，等前边的Qtile,Ktile, 都在S上了
 
         // Advance gV
-        // 算QK计算上，提前进行V的G->S
+        // 算QK计算时，提前进行V的G->S
+        // Vtile G->S  (V的多个S layout同时用)
         if (masking_step > 0) {
             tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
@@ -370,7 +371,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         flash::cp_async_wait<0>();
         __syncthreads();
-        // 等Vtile复制好了
+        // 等Vtile复制好了。 此时的Vtile,可以用于最后tOsVt中的计算。tOsVt在S上已经好了
         // 开始提前拿下个Ktile，准备写个迭代算。Qi和新的Ki
         if (n_block > n_block_min) {
             // Advance gK
@@ -390,37 +391,52 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
        
         // Convert acc_s from fp32 to fp16/bf16
-        // 把累积的acc_s Pi(Br,Bc),转成fp16
+        // 用来积累本轮O的寄存器变量acc_s(Br,Bc),转成fp16,作为Pi,参与之后的乘法计算
+        // 只是元素类型变了，layout不变
+        // 解释成一个Array,送入NumericArrayConverter
         Tensor rP = flash::convert_type<Element>(acc_s);           //   Pi(Br,Bc)           // TODO:PPU这段改了
+        
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
         int block_col_idx = n_block * (kBlockN / 32);
-        if (Return_softmax) {
+        if (Return_softmax) {  // 只是为了写回softmax
             // dropout
-            Tensor rP_drop = make_fragment_like(rP);
-            cute::copy(rP, rP_drop);
+            Tensor rP_drop = make_fragment_like(rP); // 和Pi形状相同的tensor
+            cute::copy(rP, rP_drop);                 // 把Pi复制过去
+            // Pi底层数据，做dropout
             dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
                 rP_drop, block_row_idx, block_col_idx, kNWarps
             );
-            // 复制到G上待写的softmax
+            // 把softmax+dropout后的Pi(Br,Bc)，复制到G上待写的softmax中
             cute::copy(rP_drop, tSgS);
             tSgS.data() = tSgS.data() + (-kBlockN);
         }
         if (Is_dropout) {
+            // 单纯为了Pi(Br,Bc)，做dropout,修改底层数据
             dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
         }
 
-        // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
-        // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
+        // Reshape rP from (MMA=4, MMA_M, MMA_N) 
+        // to ((4, 2), MMA_M, MMA_N / 2) if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
+        // 修改Pi(Br,Bc)的layout
+        // 原来是 (MMA=4, MMA_M, MMA_N)，每个线程为atom提供4个元素 
+        //   改成  ((4, 2), MMA_M, MMA_N / 2)  （mma_16_8_16）   (mma_atom对应m16n8k8的话，不变。 atom在k方向需要的总数依然是8个元素)
+        //   每个线程提供8个元素，K方向拓展2.以对应M=16，K=16        (原来是按K=8去partition的),
+        //    atom在K维度拓展。拓展维度减半。每个atom算的比原来多
+        //    convert_layout_acc_Aregs：只是得到新的layout。N方向拓展减半，mma_atom N方向*2。 底层数据不变
+        // 底层数据不变，
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
         // if (cute::thread0()) { print(tOrP); }
-        // 计算O:  Pi(Br,Bc) * Vtile(Bc,d)
-        // O+ = P*V
-        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+
+        // 计算O:  Pi(Br,Bc) * Vtile(Bc,d),且结果直接累积到本cudablock最终的O中：O+ = P*V
+        flash::gemm_rs(acc_o,  // 最终要累积的o
+                         tOrP, tOrVt,// 用来计算的P(Br,Bc), Vi trspose后的(Bc,Br)
+                         tOsVt,      // share_mem上的 Vi
+                         tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         // if (cute::thread0()) { print(scores); }
 
         // This check is at the end of the loop since we always have at least 1 iteration
         if (n_masking_steps > 1 && n_block <= n_block_min) {
-            --n_block;   // 更新Ktile位置
+            --n_block;   // 更新Ktile位置。下次拿下个Ktile
             break;
         }
     }

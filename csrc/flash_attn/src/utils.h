@@ -172,20 +172,26 @@ __forceinline__ __device__ void gemm(
 
 template<typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
          typename TiledMma, typename TiledCopy, typename ThrCopy>
-__forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsB,
-                               TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
+__forceinline__ __device__ void gemm_rs(Tensor0 &acc, // 本cudablock.最终修正的O(Br,Bc) 
+                               Tensor1 &tCrA, Tensor2 &tCrB, // 用来计算的P(Br,Bc), Vi trspose后的(Bc,Br)
+                               Tensor3 const& tCsB,    // share_mem上的 Vi
+                               TiledMma tiled_mma, 
+                               TiledCopy smem_tiled_copy_B,
                                ThrCopy smem_thr_copy_B) {
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+    // Vi S->R
     cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
     #pragma unroll
     for (int i = 0; i < size<2>(tCrA); ++i) {
         if (i < size<2>(tCrA) - 1) {
+            // Vi S->R (每个小迭代，提前加载下个迭代的)
             cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
         }
+        // P(Br,Bc)*Vi
         cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
     }
 }
@@ -215,7 +221,10 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
     if constexpr (mma_shape_K == 8) {
         return acc_layout;
     } else {
+        // acc_layout k是4（单线程，对应总的K是8），但需要的mma_shape_K是16（atom总的）
+        // N方向拓展中，每拆成2部分。每隔2个元素，划分
         auto l = logical_divide(acc_layout, Shape<X, X, _2>{});  // (4, MMA_M, (2, MMA_N / 2)))
+        // 新的layout: 把N方向的2提出到mma_atom方向。每个mma_atom多处理2倍的N
         return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
     }
 };
@@ -236,11 +245,13 @@ __forceinline__ __device__ auto convert_layout_acc_dropout(Layout acc_layout) {
 
 template <typename To_type, typename Engine, typename Layout>
 __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tensor) {
-    using From_type = typename Engine::value_type;
-    constexpr int numel = decltype(size(tensor))::value;
+    using From_type = typename Engine::value_type;       // 原来的类型
+    constexpr int numel = decltype(size(tensor))::value; // 元素数目
     cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
     // HACK: this requires tensor to be "contiguous"
+    // 转入地址，原始类型，元素数目，（默认是连续的），统一转完. 解释成一个Array,送入NumericArrayConverter
     auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
+    // 只是元素类型变了，layout不变
     return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
 }
 
