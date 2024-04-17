@@ -12,7 +12,9 @@ template<bool Varlen=true>
 struct BlockInfo {
 
     template<typename Params>
-    __device__ BlockInfo(const Params &params, const int bidb)
+    __device__ BlockInfo(const Params &params, 
+                                const int bidb  // 样本id
+                                )
         : sum_s_q(!Varlen || params.cu_seqlens_q == nullptr ? -1 : params.cu_seqlens_q[bidb])
         , sum_s_k(!Varlen || params.cu_seqlens_k == nullptr || !params.is_seqlens_k_cumulative ? -1 : params.cu_seqlens_k[bidb])
         , actual_seqlen_q(!Varlen || params.cu_seqlens_q == nullptr ? params.seqlen_q : params.cu_seqlens_q[bidb + 1] - sum_s_q)
@@ -21,11 +23,13 @@ struct BlockInfo {
         , seqlen_k_cache(!Varlen || params.cu_seqlens_k == nullptr ? params.seqlen_k : (params.is_seqlens_k_cumulative ? params.cu_seqlens_k[bidb + 1] - sum_s_k : params.cu_seqlens_k[bidb]))
         , actual_seqlen_k(params.seqused_k ? params.seqused_k[bidb] : seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew))
         {
+            // fwd情况下，actual_seqlen_q，seqlen_k_cache都对应完整Tq,Tv
         }
 
     template <typename index_t>
     __forceinline__ __device__ index_t q_offset(const index_t batch_stride, const index_t row_stride, const int bidb) const {
-        return sum_s_q == -1 ? bidb * batch_stride : uint32_t(sum_s_q) * row_stride;
+        return sum_s_q == -1 ? bidb * batch_stride // 样本的offset
+                               : uint32_t(sum_s_q) * row_stride;
     }
 
     template <typename index_t>

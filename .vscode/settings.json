@@ -10,6 +10,9 @@
         "variant": "cpp",
         "bitset": "cpp",
         "string_view": "cpp",
-        "initializer_list": "cpp"
+        "initializer_list": "cpp",
+        "chrono": "cpp",
+        "cmath": "cpp",
+        "type_traits": "cpp"
     }
 }

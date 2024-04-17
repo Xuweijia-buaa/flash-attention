@@ -238,14 +238,24 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
 // splits as that would incur more HBM reads/writes.
 // So we find the best efficiency, then find the smallest number of splits that gets 85%
 // of the best efficiency.
+// 每个Qi,可以只算Tv中，部分kv的结果（在一个cudablock中）.该Qi所有kv的结果，最后再汇总
+// 这里计算同一Qi的Tv对应的kvblocks,最好的分组数目，（到不同cudablocks中），使SM利用率最高 （同时希望num_split尽可能小，降低后续同步的overhead）
 inline int num_splits_heuristic(
     int batch_nheads_mblocks,   // batch*nhead*   m方向的blocks(Tq切分)   每个块Qi，交给一个cudablock处理，迭代Tv。
     int num_SMs,                // 设备上总的SM数目
-     int num_n_blocks,          // Tv方向的block数目
+     int num_n_blocks,          // Tv方向的kv blocks数目。 对这些kv块分割，在不同cudablock中做计算
      int max_splits) {          // 128
     // If we have enough to almost fill the SMs, then just use 1 split
+    // 如果每个cudablock,处理一个Q块，和所有KV块。（某个head上的）。
+    // 有较好的利用率，就keep this way
     if (batch_nheads_mblocks >= 0.8f * num_SMs) { return 1; }
-    max_splits = std::min({max_splits, num_SMs, num_n_blocks});
+
+    // 如果kv太长了，q可以每次只和一部分kv块做计算。（分到一个cudablock上的任务），
+    // 最终同一个q,对应的不同cudablocks的结果，累积起来 
+    // 原来 Qi(Br，d)  [d,Tv] -> S(Br,Tv) -softmax-> P(Br,Tv) * V(Tv,d) -> Oi(Br,d)
+    // 现在Qi不变，每个cudablock只算部分KV，做部分softmax P(Br,Tv_i),得到Oi(Br,d)是只考虑部分kv的部分和,需要和该Qi其他结果累积,且统一softmax,得最终Oi(Br,d)
+    // 计算kv的切分数（切到不同cudablock上）
+    max_splits = std::min({max_splits, num_SMs, num_n_blocks}); // 不能超过Tv方向的block数目
     float max_efficiency = 0.f;
     std::vector<float> efficiency;
     efficiency.reserve(max_splits);
@@ -254,6 +264,7 @@ inline int num_splits_heuristic(
     // we'll have 6 * 10 + 4 blocks. If we choose 12 splits, we'll have 6 * 11 + (-2) blocks
     // (i.e. it's 11 splits anyway).
     // So we check if the number of blocks per split is the same as the previous num_splits.
+    // 64个kv块：分11组(6*10+4)或者（6*11）都是11组。即使分组数-1
     auto is_split_eligible = [&ceildiv, &num_n_blocks](int num_splits) {
         return num_splits == 1 || ceildiv(num_n_blocks, num_splits) != ceildiv(num_n_blocks, num_splits - 1);
     };
@@ -261,6 +272,9 @@ inline int num_splits_heuristic(
         if (!is_split_eligible(num_splits)) {
             efficiency.push_back(0.f);
         } else {
+            // 假设分num_splits组。
+            // 共需要batch_nheads_mblocks * num_splits个cuda_block，总共只有n个sm
+            // 计算利用率，选利用率最大的split数目
             float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
             float eff = n_waves / ceil(n_waves);
             // printf("num_splits = %d, eff = %f\n", num_splits, eff);
@@ -295,12 +309,19 @@ void set_params_splitkv(Flash_fwd_params &params, const int batch_size,
     // In any case we don't expect seqlen_q to be larger than 64 for inference.
     const int num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
 
-    // qkv每个块，拿到share_mem，对应一次计算。
+    // qkv每个块，拿到share_mem中，对应一次计算。
     // cudablocks内部，固定qi(m,d), 迭代kivi所有块,计算oi(m,d)
     // 每个块Qi，交给一个cudablock处理，迭代Tv。(共batch*nhead*m)个Qi块。 每个Qi(Br,d=head_dim)
+    // split_kv
+    //   也可以对整个Tv进行拆分，
+    //   每个cudablock内的固定Qi,只算部分kv的结果。
+    //   该Qi所有kv的结果，最后再汇总
+    //  这里计算同一Qi的Tv对应的kvblocks,最好的分组数目，（到不同cudablocks中），使SM利用率最高 （同时希望num_split尽可能小，降低后续同步的overhead）
     params.num_splits = num_splits;
     if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
         if (num_splits < 1) {
+            // 这里计算Tv对应的kvblocks，拆分的数目， 
+            // 拆好后，每个cudablock只算其中1/num_splits。即num_n_blocks/num_splits个kv块。
             params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, 
                                  dprops->multiProcessorCount, 
                                  num_n_blocks, 128);

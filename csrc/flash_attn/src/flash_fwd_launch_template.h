@@ -26,6 +26,7 @@
 template<typename Kernel_traits, __VA_ARGS__> \
 __global__ void kernelName(KERNEL_PARAM_MODIFIER const Flash_fwd_params params)
 
+// 每个cudablock. 处理Qi和全部KV
 DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Return_softmax) {
     #if defined(ARCH_SUPPORTS_FLASH)
         static_assert(!(Is_causal && Is_local)); // Enforce constraints
@@ -35,6 +36,7 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_dropout, bool Is_causal, b
     #endif
 }
 
+// 每个cudablock. 处理Qi和其部分KV
 DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_kernel, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV) {
     #if defined(ARCH_SUPPORTS_FLASH)
         flash::compute_attn_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Split, Append_KV>(params);
@@ -43,6 +45,7 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_kernel, bool Is_causal, bool Is_lo
     #endif
 }
 
+// 合并Qi对应的所有kv得出的Oi部分和。得到完整Oi结果
 DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int Log_max_splits, bool Is_even_K) {
     static_assert(Log_max_splits >= 1);
     flash::combine_attn_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K>(params);
@@ -90,6 +93,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                         }
 
                         // 执行kernel
+                        // 线程数是 Kernel_traits::kNThreads = kNWarps * 32;
                         kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
                     });
@@ -106,6 +110,9 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
     // 对整个Tq进行拆分，拆成kBlockM大小. 共num_m_block个
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+    
+    // 如果split_kv:
+    // 
     // split==1:grid(num_m_blocks,b,h):batch中每个样本，每个head中，Tq的一个块Qi,交给一个cudablock处理 (num_blocks,b,h)
     // split>1:grid(num_m_blocks,num_splits,bh): TODO 
     dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);

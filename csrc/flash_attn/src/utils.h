@@ -135,10 +135,17 @@ template<bool A_in_regs=false, bool B_in_regs=false, typename Tensor0, typename 
          typename Tensor2, typename Tensor3, typename Tensor4,
          typename TiledMma, typename TiledCopyA, typename TiledCopyB,
          typename ThrCopyA, typename ThrCopyB>
-__forceinline__ __device__ void gemm(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
-                            Tensor4 const& tCsB, TiledMma tiled_mma,
+__forceinline__ __device__ void gemm(
+                            // 本次tile计算的结果，；累积到acc中
+                            Tensor0 &acc,  
+                            // 为完成该Tile(QiKi)计算，需要的mma的layout。每个线程需要提供的寄存器数据
+                            Tensor1 &tCrA, Tensor2 &tCrB, 
+                            // S->R的源 sQ
+                            Tensor3 const& tCsA,Tensor4 const& tCsB, 
+                            TiledMma tiled_mma,
                             TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
-                            ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B) {
+                            ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B
+                            ) {
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
@@ -146,14 +153,17 @@ __forceinline__ __device__ void gemm(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
     CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+    // S->R
     if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{})); }
     if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{})); }
     #pragma unroll
     for (int i = 0; i < size<2>(tCrA); ++i) {
         if (i < size<2>(tCrA) - 1) {
+            // 边copy
             if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1)); }
             if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1)); }
         }
+        // 边计算
         cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
     }
 }
@@ -292,12 +302,20 @@ void cp_async_wait() {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
-          typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
-          typename Engine2, typename Layout2, typename Engine3, typename Layout3>
+template <bool Is_even_MN=true, 
+          bool Is_even_K=true,
+          bool Clear_OOB_MN=false, 
+          bool Clear_OOB_K=true,
+          typename TiledCopy, 
+          typename Engine0, typename Layout0, // 作为S， <MMA,MMA_M,MMA_K>
+          typename Engine1, typename Layout1, // 作为D   <MMA,MMA_M,MMA_K>
+          typename Engine2, typename Layout2, // 作为identity_MN
+          typename Engine3, typename Layout3> // 作为predicate_K    mask K维度
 __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const &S,
-                            Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
-                            Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0) {
+                            Tensor<Engine1, Layout1> &D, 
+                            Tensor<Engine2, Layout2> const &identity_MN,
+                            Tensor<Engine3, Layout3> const &predicate_K, 
+                            const int max_MN=0) {
     CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
     CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
     CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
@@ -307,11 +325,12 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
     static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
     #pragma unroll
     for (int m = 0; m < size<1>(S); ++m) {
-        if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
+        // 沿MMA_M迭代
+        if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) { // 不超过最大MMA_M
             #pragma unroll
-            for (int k = 0; k < size<2>(S); ++k) {
+            for (int k = 0; k < size<2>(S); ++k) {  // MMA_N方向
                 if (Is_even_K || predicate_K(k)) {
-                    cute::copy(tiled_copy, S(_, m, k), D(_, m, k));
+                    cute::copy(tiled_copy, S(_, m, k), D(_, m, k)); // 复制一个
                 } else if (Clear_OOB_K) {
                     cute::clear(D(_, m, k));
                 }

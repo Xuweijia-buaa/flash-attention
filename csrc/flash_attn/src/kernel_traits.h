@@ -29,7 +29,7 @@ struct Flash_kernel_traits {
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
     using MMA_Atom_Arch = std::conditional_t<
         std::is_same_v<elem_type, cutlass::half_t>,
-        MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
+        MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,                    // mma_atom  mnk 16_8_16
         MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>
     >;
 #else
@@ -37,7 +37,7 @@ struct Flash_kernel_traits {
 #endif
 
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 750
-    using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
+    using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;     //  S->R   ldmatrix
     using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
 #else
     using SmemCopyAtom = Copy_Atom<DefaultCopy, elem_type>;
@@ -67,9 +67,9 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kBlockN = kBlockN_;
     static constexpr int kHeadDim = kHeadDim_;
     static_assert(kHeadDim % 32 == 0);
-    static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
+    static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;  // h=64,这里是64. 否则是32
     static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
-    static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
+    static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3; // 32是2， 64是3
 
     using TiledMma = TiledMMA<
         typename Base::MMA_Atom_Arch,
@@ -83,11 +83,11 @@ struct Flash_fwd_kernel_traits : public Base {
                            Stride<Int<kBlockKSmem>, _1>>{}));
     using SmemLayoutQ = decltype(tile_to_shape(
         SmemLayoutAtomQ{},
-        Shape<Int<kBlockM>, Int<kHeadDim>>{}));
+        Shape<Int<kBlockM>, Int<kHeadDim>>{})); // (Br,d)
 
     using SmemLayoutKV = decltype(tile_to_shape(
         SmemLayoutAtomQ{},
-        Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+        Shape<Int<kBlockN>, Int<kHeadDim>>{}));//(Bc,d)
 
     // https://github.com/ColfaxResearch/cutlass-kernels/blob/a222587e6d59b93ba704853d3946fb686d8b8892/src/fmha/fmha_forward.cu#L434
     using SmemLayoutVtransposed = decltype(
@@ -108,15 +108,18 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
     static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
 
-    static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
+    static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element); // 8个元素
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");
     // Using kBlockKSmem here is 6-10% faster than kBlockKGmem for d=128 because of bank conflicts.
     // For example, for d=128, smem is split into 2 "pages", each page takes care of columns
     // 0-63 and 64-127. If we have 16 threads per row for gmem read, when we write to smem,
     // thread 0 - 7 will write to the first page and thread 8 - 15 will write to the second page,
     // to the same banks.
-    static constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;
+    static constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad; // 32/64  / 8= 4/8
     static_assert(kNThreads % kGmemThreadsPerRow == 0, "kNThreads must be a multiple of kGmemThreadsPerRow");
+
+    // 128个线程，线程本身的排布
+    // (16,8):(8,1). 每行8个线程,读64个元素. 一个可以读(16,64)的块
     using GmemLayoutAtom = Layout<Shape <Int<kNThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
 
@@ -128,10 +131,10 @@ struct Flash_fwd_kernel_traits : public Base {
         DefaultCopy
     >;
     using GmemTiledCopyQKV = decltype(
-        make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},// 优先用cp.aync  G->S
                         GmemLayoutAtom{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
-    using GmemTiledCopyO = decltype(
+    using GmemTiledCopyO = decltype(                // O的写入
         make_tiled_copy(Copy_Atom<DefaultCopy, Element>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
