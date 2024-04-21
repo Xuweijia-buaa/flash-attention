@@ -114,7 +114,8 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // 如果split_kv:
     // 
     // split==1:grid(num_m_blocks,b,h):batch中每个样本，每个head中，Tq的一个块Qi,交给一个cudablock处理 (num_blocks,b,h)
-    // split>1:grid(num_m_blocks,num_splits,bh): TODO 
+    // split>1:grid(num_m_blocks,num_splits,bh): 
+    //         (每个样本每个h中的)每个Qi，对应num_splits个kv. 每个cudablock处理其中一块kv。
     dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
     
     const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;

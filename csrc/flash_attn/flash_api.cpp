@@ -56,7 +56,7 @@ void set_params_fprop(Flash_fwd_params &params,
     params.v_ptr = v.data_ptr();
     // All stride are in elements, not bytes.
     params.q_row_stride = q.stride(-3);  // 1吧。最后一维
-    params.k_row_stride = k.stride(-3);
+    params.k_row_stride = k.stride(-3);  // 
     params.v_row_stride = v.stride(-3);
     params.q_head_stride = q.stride(-2); // 不同head间stride.   head_dim * stride_head_dim
     params.k_head_stride = k.stride(-2);
@@ -585,7 +585,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     CHECK_DEVICE(cu_seqlens_q);
     CHECK_DEVICE(cu_seqlens_k);
 
-    at::Tensor block_table;
+    // (B,T)   放每个seq的blockid
+    at::Tensor block_table; 
     const bool paged_KV = block_table_.has_value();
     if (paged_KV) {
         block_table = block_table_.value();
@@ -1273,8 +1274,25 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     return { dq, dk, dv, softmax_d };
 }
 
+// kvcache已经按paged_block_size分了块，且按分块存储
+// 每个seq对应固定了块。记录在block_table里
 std::vector<at::Tensor>
 mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_heads x head_size
+// 如果对该q, 要算的所有kv cache分了块
+// 每page_block_size个token一块。
+// 传进来的，是每个seq的blocks, 对应的（num_seq_blocks,page_block_size x num_heads_k x head_size）。
+// 本batch, 所有seq拼一起,共num_blocks个blocks
+// 每个block,每个token对应大小(nhead*head_dim) 
+// （num_blocks x page_block_size x num_heads_k x head_size）
+// 和后边的split_kv无关。这里只是应用端的分块。已经分好了KVcache块
+// 应用端，整个kv都是按block存储的
+
+// kernel端计算split_kv，尽管也是切分成TIle大小的小块，每个cudablock处理一块
+// 但是有可能涉及到的小块，在本tv的某些kv block中。因为应用端，整个kv都是按block存储的
+// 因此算的某些tile, 要找到其对应的paged block, 从而找到其在内存中的位置。
+
+// 而 block_table（batch_size, max_num_blocks_per_seq）
+// 放每个seq的kv blockid.  代表其所有kv
                 const at::Tensor &kcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                 const at::Tensor &vcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                 c10::optional<const at::Tensor> &k_, // batch_size x seqlen_knew x num_heads_k x head_size
@@ -1317,6 +1335,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     TORCH_CHECK(kcache.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(vcache.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
+    //  batch_size, max_num_blocks_per_seq
+    // 放每个seq的kv blockid
     at::Tensor block_table;
     const bool paged_KV = block_table_.has_value();
     if (paged_KV) {
@@ -1336,9 +1356,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : kcache.size(0);
-    const int page_block_size = !paged_KV ? 1 : kcache.size(1);
+    const int page_block_size = !paged_KV ? 1 : kcache.size(1); // 每n个token，一个block
     TORCH_CHECK(!paged_KV || page_block_size % 256 == 0, "Paged KV cache block size must be divisible by 256");
-    const int seqlen_k = !paged_KV ? kcache.size(1) : max_num_blocks_per_seq * page_block_size;
+    const int seqlen_k = !paged_KV ? kcache.size(1) : max_num_blocks_per_seq * page_block_size; // 最大Tv
     const int num_heads_k = kcache.size(2);
     const int batch_size_c = !paged_KV ? kcache.size(0) : batch_size;
     TORCH_CHECK(batch_size > 0, "batch size must be postive");

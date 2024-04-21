@@ -364,7 +364,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         );
         // if (cute::thread0()) { print(acc_s); }
 
-        // Si(Br,Bc) ->只是应用mask（softmax之前的） ->Si(Br,Bc)。 只对mask处
+        // Si(Br,Bc) ->只是应用mask（softmax之前的） ->Si(Br,Bc)。 只mask
         mask.template apply_mask<Is_causal, Is_even_MN>(
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
@@ -444,6 +444,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // These are the iterations where we don't need masking on S
     // 不需要mask的迭代，类似
     for (; n_block >= n_block_min; --n_block) {
+        // 迭代不同Tile
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
         flash::cp_async_wait<0>();
@@ -469,6 +470,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             cute::cp_async_fence();
         }
 
+        // 尽管写了mask，但不是causal mask。 而是处理可能的alibi（attention上加偏移）和local(slise_window)
         mask.template apply_mask</*Causal_mask=*/false>(
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
@@ -498,10 +500,15 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
 
     // Epilogue
+    // 不是直接r->G，而是先写到S,做了重排，写回r。再以较大带宽写入G
 
+    // 统一校准softmax
+    // acc_o -> 校准后的(Br,d)。是该Oi 迭代完所有KV的计算结果 Oi(Br,d)
+    // 同时输出每行的sum (对应论文中最后一块 mi+log(li))
     Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
 
     // Convert acc_o from fp32 to fp16/bf16
+    // 1 r->S
     Tensor rO = flash::convert_type<Element>(acc_o);
     Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});    // (SMEM_M,SMEM_N)
     // Partition sO to match the accumulator partitioning
@@ -513,8 +520,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // sO has the same size as sQ, so we don't need to sync here.
     if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
 
-    cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
+    cute::copy(smem_tiled_copy_O, taccOrO, taccOsO); //r->S
 
+    // 2 G中的shape
     const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
         + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
     const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
@@ -531,7 +539,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     __syncthreads();
 
-    Tensor tOrO = make_tensor<Element>(shape(tOgO));
+    // S->r  (又写回r。r形状和G中相同) 
+    Tensor tOrO = make_tensor<Element>(shape(tOgO));// G中的shape对应的寄存器
     cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
 
     Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
@@ -544,10 +553,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         #pragma unroll
         for (int mi = 0; mi < size(lse); ++mi) {
             const int row = get<0>(taccOcO_row(mi));
-            if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSE(row) = lse(mi); }
+            if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSE(row) = lse(mi); } // 每行复制到
         }
     }
 
+    // 3 重排后的r->G
     // Construct identity layout for sO
     Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
     // Repeat the partitioning with identity layouts
@@ -559,7 +569,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
     flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+        gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM  // r->G
     );
 }
 
@@ -595,7 +605,12 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // if (threadIdx.x == 0 && blockIdx.y == 1 && blockIdx.z == 0) { printf("params.knew_ptr = %p, seqlen_k_cache + seqlen_knew = %d\n", params.knew_ptr, binfo.seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew)); }
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
+    // (每个样本每个h中的)每个Qi，对应num_splits个kv. 每个cudablock处理其中一块kv。
+    // Tv分了(params.seqlen_k + kBlockN - 1) / kBlockN个块
+    // 每个split含多少kv块：
     const int n_blocks_per_split = ((params.seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
+
+    // 本cudablock, 要处理的kv块起止id
     const int n_block_min = !Is_local
         ? n_split_idx * n_blocks_per_split
         : std::max(n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
@@ -604,6 +619,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
     }
+
+    // 类似上边，同样是early exit, 对于不用计算的情况，线程直接退出。写0
     if (n_block_min >= n_block_max) {  // This also covers the case where n_block_max <= 0
         // We exit early and write 0 to gOaccum and -inf to gLSEaccum.
         // Otherwise we might read OOB elements from gK and gV,
@@ -653,17 +670,44 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         + m_block * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
     // We move K and V to the last block.
     const int bidb_cache = params.cache_batch_idx == nullptr ? bidb : params.cache_batch_idx[bidb];
+
+    //  block_table:（batch_size, max_num_blocks_per_seq）
+    //               放每个seq的kv blockid
+    // 应用端，所有kv ,都是按paged_block大小，在物理上存储的。  每page_block_size个token,对应一个paged_block
+    // 每个seq的kv, 含多个kv paged blocks. 和是否split kv无关
+
+    // 每个paged block,每个token对应大小(nhead*head_dim)
+    // 每个seq的blocks, 对应多个blocks:（num_seq_blocks,page_block_size x num_heads_k x head_size）
+    // 传进来的，是所有seq拼一起,共num_blocks个blocks
+    // k,v: （num_blocks x page_block_size x num_heads_k x head_size）  
+
+    // kernel端计算split_kv，尽管也是切分成TIle大小的小块，每个cudablock处理一块
+    // 但是涉及到的Tile，在本tv的某些kv block中。因为应用端，整个kv都是按block存储的
+    // 所以算某些tile时, 要找到其对应的paged block, 从而找到其在内存中的位置。
+
+
+    // 该seq的所有kv block, 整体按paged_block_size划分，存储
+    // block_table: 本seq Tv对应的block_ids
     const int *block_table = params.block_table == nullptr ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
+    // 本cudablock, 处理的最大kv tile，所在的kv块号 （paged块号）
     const int block_table_idx = block_table == nullptr ? 0 : (n_block_max - 1) * kBlockN / params.page_block_size;
+    // 本cudablock，所处理的token, 在所在kv块中的 token offset
     const int block_table_offset = block_table == nullptr ? 0 : (n_block_max - 1) * kBlockN - block_table_idx * params.page_block_size;
+    // 根据block_table_idx，得到整个batch中的block offset
+
+
     const index_t row_offset_k = block_table == nullptr
         ? binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb_cache)
           + (n_block_max - 1) * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride
-        : block_table[block_table_idx] * params.k_batch_stride + block_table_offset * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
+        : block_table[block_table_idx] * params.k_batch_stride  // paged_block offset   k_batch_stride是相邻block间的间隔
+         + block_table_offset * params.k_row_stride             // token offset
+         + (bidh / params.h_h_k_ratio) * params.k_head_stride;  // head_offset
     const index_t row_offset_v = block_table == nullptr
         ? binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb_cache)
           + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride
-        : block_table[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
+        : block_table[block_table_idx] * params.v_batch_stride 
+        + block_table_offset * params.v_row_stride 
+        + (bidh / params.h_h_k_ratio) * params.v_head_stride;
 
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -833,10 +877,14 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
             } else {
                 if (n_block > n_block_copy_min) {
+                    // 当前tile所在的block_id，block_offset
                     const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
                     const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
+                    // 下一Ktile所在的block_id，block_offset
                     const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
                     const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
+                    // block_id变了多少,要移动到该内存处。k_batch_stride是相邻block间的间隔
+                    // offset_diff是token offset
                     const int table_diff = block_table[block_table_idx_next] - block_table[block_table_idx_cur];
                     const int offset_diff = block_table_offset_next - block_table_offset_cur;
                     tVgV.data() = tVgV.data() + table_diff * params.v_batch_stride + offset_diff * params.v_row_stride;
@@ -929,6 +977,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             if (block_table == nullptr) {
                 tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
             } else {
+                // 拿下一个K tile
                 const int block_table_idx_cur = (n_block + 1) * kBlockN / params.page_block_size;
                 const int block_table_offset_cur = (n_block + 1) * kBlockN - block_table_idx_cur * params.page_block_size;
                 const int block_table_idx_next = n_block * kBlockN / params.page_block_size;
@@ -1160,12 +1209,28 @@ inline __device__ void compute_attn(const Params &params) {
 
 template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_splitkv(const Params &params) {
+
+
+    //(每个样本每个h中的)每个Qi，对应num_splits个kv. 每个cudablock处理其中一块kv。
+    // 对应grid==(num_m_blocks,num_splits,bh)
+
+    // 本cudablock:
+
+    // Tq中要处理的Qi 固定
     const int m_block = blockIdx.x;
+
+    // 处理的样本id
     // The block index for the batch.
     const int bidb = Split ? blockIdx.z / params.h : blockIdx.y;
+
+    // 处理的headid
     // The block index for the head.
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
+
+    // 处理的kv块  对应的split_id
     const int n_split_idx = Split ? blockIdx.y : 0;
+
+    // Tv总的kv块，总共分了几个split
     const int num_n_splits = Split ? gridDim.y : 1;
     flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }

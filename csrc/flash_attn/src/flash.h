@@ -103,7 +103,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     // Paged KV cache
     int * __restrict__ block_table;
-    index_t block_table_batch_stride;
+    index_t block_table_batch_stride; // 不同样本间的block_table的间隔
     int page_block_size;
 
     // The dropout probability (probability of keeping an activation).
